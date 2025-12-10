@@ -1,0 +1,33 @@
+[Unit]
+Description=System Monitoring Service for Graylog
+Documentation=https://graylog.syushi.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/monitoring/monitoring.sh
+Restart=on-failure
+RestartSec=10s
+
+# セキュリティ設定
+User=root
+Group=root
+
+# プロセス管理
+PIDFile=/opt/monitoring/var/monitoring.pid
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# リソース制限（任意）
+CPUQuota=10%
+MemoryLimit=100M
+
+# ログ出力
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=monitoring
+
+[Install]
+WantedBy=multi-user.target
