@@ -1,6 +1,15 @@
 #!/bin/bash
-# script-version:02-003
+# script-version:02-004
 # Required packages: vnstat sysstat bc dnsutils netcat-openbsd gzip
+#
+# Changelog v02-004:
+# - Fixed network monitoring data extraction from vnstat
+# - Improved CPU sampling (1->3 iterations for stable average)
+# - Added proper field naming: _used, _total, _free for memory/swap/disk
+# - Enhanced error handling and logging
+# - Fixed field assignments to prevent data confusion
+# - Added network bandwidth calculation
+# - Improved vnstat output parsing
 
 # Default configuration
 CONFIG_DIR="/etc/monitoring"
@@ -9,6 +18,7 @@ RUN_DIR="/opt/monitoring/var"
 PIDFILE="${RUN_DIR}/monitoring.pid"
 IPFILE="${VAR_DIR}/myip"
 HOSTIDFILE="${VAR_DIR}/hostid"
+NET_PREV_FILE="${VAR_DIR}/net_prev"
 LOG_TAG="monitoring"
 
 # Load configuration if exists
@@ -34,6 +44,10 @@ log_info() {
     [ "$DEBUG" = "true" ] && echo "[INFO] $1"
 }
 
+log_debug() {
+    [ "$DEBUG" = "true" ] && echo "[DEBUG] $1"
+}
+
 # Generate or load HOST_ID
 init_host_id() {
     if [ ! -f "$HOSTIDFILE" ]; then
@@ -57,7 +71,7 @@ init() {
         fi
     done
 
-    local deps=(iostat free vnstat dig nc gzip bc)
+    local deps=(iostat free vnstat dig nc gzip bc awk)
     for cmd in "${deps[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             log_error "Required command not found: $cmd"
@@ -99,34 +113,50 @@ update_ip() {
     fi
 }
 
-# Convert GiB to MiB
-convert_gib_to_mib() {
+# Convert various units to MiB
+convert_to_mib() {
     local input="$1"
+    local value=$(echo "$input" | sed 's/[^0-9.]//g')
+    local unit=$(echo "$input" | sed 's/[0-9.]//g' | tr -d ' ')
     local output
 
-    if [[ $input == *'GiB'* ]]; then
-        local gib_value=$(echo "$input" | sed 's/[^0-9.]*//g')
-        output=$(echo "scale=2; $gib_value * 1024" | bc)
-    else
-        output=$(echo "$input" | sed 's/[^0-9.]*//g')
-    fi
+    case "$unit" in
+        GiB|GB|G)
+            output=$(echo "scale=2; $value * 1024" | bc)
+            ;;
+        MiB|MB|M|"")
+            output="$value"
+            ;;
+        KiB|KB|K)
+            output=$(echo "scale=2; $value / 1024" | bc)
+            ;;
+        *)
+            log_debug "Unknown unit '$unit' in '$input', treating as MiB"
+            output="$value"
+            ;;
+    esac
+    
     echo "${output:-0}"
 }
 
-# Send data to Graylog
+# Send data to Graylog (Enhanced GELF format)
 convert_to_gelf() {
     local monitor_type="$1"
     local device="$2"
     local timestamp="$3"
     local utilization="${4:-0}"
-    local rx="${5:-0}"
-    local tx="${6:-0}"
-    local group="$7"
-    local rate="${8:-0}"
-    local empt_size="${9:-0}"
-    local load_1min="${10:-0}"
-    local load_5min="${11:-0}"
-    local load_15min="${12:-0}"
+    local group="$5"
+    
+    # Optional parameters with defaults
+    local used="${6:-0}"
+    local total="${7:-0}"
+    local free="${8:-0}"
+    local rx="${9:-0}"
+    local tx="${10:-0}"
+    local rate="${11:-0}"
+    local load_1min="${12:-0}"
+    local load_5min="${13:-0}"
+    local load_15min="${14:-0}"
     local ip_g
 
     ip_g=$(cat "$IPFILE" 2>/dev/null || echo "unknown")
@@ -138,14 +168,16 @@ convert_to_gelf() {
     "short_message": "$monitor_type",
     "timestamp": $timestamp,
     "_host_id": "$HOST_ID",
-    "_ip-g": "$ip_g",
+    "_ip_g": "$ip_g",
     "_device": "$device",
+    "_group": "$group",
     "_utilization": $utilization,
+    "_used": $used,
+    "_total": $total,
+    "_free": $free,
     "_rx": $rx,
     "_tx": $tx,
-    "_group": "$group",
     "_rate": $rate,
-    "_empt_size": $empt_size,
     "_load_1min": $load_1min,
     "_load_5min": $load_5min,
     "_load_15min": $load_15min
@@ -153,71 +185,140 @@ convert_to_gelf() {
 EOF
     )
 
+    log_debug "Sending: $monitor_type - $device - utilization: $utilization%"
+
     if ! echo -n "$json" | gzip | nc -w 1 -u "$GRAYLOG_SERVER" "$GRAYLOG_PORT" 2>/dev/null; then
-        [ "$DEBUG" = "true" ] && log_error "Failed to send data to Graylog (type: $monitor_type)"
+        [ "$DEBUG" = "true" ] && log_error "Failed to send data to Graylog (type: $monitor_type, device: $device)"
         return 1
     fi
+}
+
+# Calculate network bandwidth utilization
+calculate_network_utilization() {
+    local rx_mib="$1"
+    local tx_mib="$2"
+    local interval="$3"
+    
+    # Read previous values
+    if [ -f "$NET_PREV_FILE" ]; then
+        local prev_data=$(cat "$NET_PREV_FILE")
+        local prev_time=$(echo "$prev_data" | cut -d',' -f1)
+        local prev_rx=$(echo "$prev_data" | cut -d',' -f2)
+        local prev_tx=$(echo "$prev_data" | cut -d',' -f3)
+        
+        local time_diff=$(($(date +%s) - prev_time))
+        
+        if [ "$time_diff" -gt 0 ]; then
+            local rx_rate=$(echo "scale=2; ($rx_mib - $prev_rx) / $time_diff" | bc)
+            local tx_rate=$(echo "scale=2; ($tx_mib - $prev_tx) / $time_diff" | bc)
+            local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
+            
+            # Assume 1Gbps = 125 MB/s = 119.2 MiB/s
+            # Adjust this value based on your network interface speed
+            local bandwidth_mibps=119.2
+            local utilization=$(echo "scale=2; ($total_rate / $bandwidth_mibps) * 100" | bc)
+            
+            # Cap at 100%
+            utilization=$(echo "$utilization" | awk '{if($1>100) print 100; else print $1}')
+            
+            echo "$utilization,$rx_rate,$tx_rate"
+        else
+            echo "0,0,0"
+        fi
+    else
+        echo "0,0,0"
+    fi
+    
+    # Save current values
+    echo "$(date +%s),$rx_mib,$tx_mib" > "$NET_PREV_FILE"
 }
 
 # Collect and send monitoring data
 collect_data() {
     local timestamp=$(date +%s)
 
-    # ロードアベレージの取得
+    # Load average
     local load_avg=$(uptime | awk -F'load average:' '{print $2}' | sed 's/,//g')
     local load_1min=$(echo "$load_avg" | awk '{print $1}')
     local load_5min=$(echo "$load_avg" | awk '{print $2}')
     local load_15min=$(echo "$load_avg" | awk '{print $3}')
 
-    # CPU monitoring
-    if iostat_output=$(iostat -c 1 2 | tail -n +4 | tail -1 2>/dev/null); then
-        local utilization=$(echo "$iostat_output" | awk '{print 100 - $NF}')
-        convert_to_gelf "iostat" "CPU" "$timestamp" "$utilization" "0" "0" "CPU" "0" "0" "$load_1min" "$load_5min" "$load_15min"
+    # CPU monitoring (improved: 3 samples for stable average)
+    if iostat_output=$(iostat -c 1 3 2>/dev/null | tail -n +4 | tail -1); then
+        local utilization=$(echo "$iostat_output" | awk '{printf "%.2f", 100 - $NF}')
+        convert_to_gelf "iostat" "CPU" "$timestamp" "$utilization" "CPU" \
+            "0" "0" "0" "0" "0" "0" "$load_1min" "$load_5min" "$load_15min"
     else
         log_error "Failed to get CPU stats"
     fi
 
-    # Memory monitoring (without Swap)
-    if mem_output=$(free -m | grep Mem 2>/dev/null); then
+    # Memory monitoring
+    if mem_output=$(free -m 2>/dev/null | grep "^Mem:"); then
         local total=$(echo "$mem_output" | awk '{print $2}')
         local used=$(echo "$mem_output" | awk '{print $3}')
-        local utilization=$(echo "$mem_output" | awk '{print $3/$2 * 100.0}')
-        convert_to_gelf "free" "Memory" "$timestamp" "$utilization" "$used" "$total" "Memory" "0" "0" "0" "0" "0"
+        local free=$(echo "$mem_output" | awk '{print $4}')
+        local available=$(echo "$mem_output" | awk '{print $7}')
+        
+        # Use available memory for more accurate calculation
+        local utilization=$(echo "scale=2; (($total - $available) / $total) * 100" | bc)
+        
+        convert_to_gelf "free" "Memory" "$timestamp" "$utilization" "Memory" \
+            "$used" "$total" "$available" "0" "0" "0" "0" "0" "0"
     else
         log_error "Failed to get memory stats"
     fi
 
     # Swap monitoring
-    if swap_output=$(free -m | grep Swap 2>/dev/null); then
+    if swap_output=$(free -m 2>/dev/null | grep "^Swap:"); then
         local total=$(echo "$swap_output" | awk '{print $2}')
         local used=$(echo "$swap_output" | awk '{print $3}')
+        local free=$(echo "$swap_output" | awk '{print $4}')
         
+        local utilization=0
         if [ "$total" -gt 0 ]; then
-            local utilization=$(echo "scale=2; $used/$total * 100" | bc)
-            convert_to_gelf "swap" "Swap" "$timestamp" "$utilization" "$used" "$total" "Swap" "0" "0" "0" "0" "0"
-        else
-            convert_to_gelf "swap" "Swap" "$timestamp" "0" "0" "0" "Swap" "0" "0" "0" "0" "0"
+            utilization=$(echo "scale=2; ($used / $total) * 100" | bc)
         fi
+        
+        convert_to_gelf "swap" "Swap" "$timestamp" "$utilization" "Swap" \
+            "$used" "$total" "$free" "0" "0" "0" "0" "0" "0"
     else
         log_error "Failed to get swap stats"
     fi
 
-    # Network monitoring
-    if net_output=$(vnstat --oneline 2>/dev/null | cut -d ";" -f 11); then
-        local rx=$(convert_gib_to_mib "$(echo "$net_output" | cut -d ";" -f 4)")
-        local tx=$(convert_gib_to_mib "$(echo "$net_output" | cut -d ";" -f 5)")
-        local rate=$(echo "$net_output" | cut -d ";" -f 7)
-        local utilization=$(echo "$net_output" | awk '{print $1}')
-        convert_to_gelf "vnstat" "Network" "$timestamp" "$utilization" "$rx" "$tx" "Network" "$rate" "0" "0" "0" "0"
+    # Network monitoring (FIXED)
+    if net_output=$(vnstat --oneline 2>/dev/null); then
+        local interface=$(echo "$net_output" | cut -d';' -f2 | tr -d ' ')
+        
+        # Extract today's traffic (fields 4 and 5)
+        local rx_raw=$(echo "$net_output" | cut -d';' -f4 | tr -d ' ')
+        local tx_raw=$(echo "$net_output" | cut -d';' -f5 | tr -d ' ')
+        
+        # Convert to MiB
+        local rx_mib=$(convert_to_mib "$rx_raw")
+        local tx_mib=$(convert_to_mib "$tx_raw")
+        
+        # Calculate bandwidth utilization and rate
+        local net_calc=$(calculate_network_utilization "$rx_mib" "$tx_mib" "$INTERVAL")
+        local utilization=$(echo "$net_calc" | cut -d',' -f1)
+        local rx_rate=$(echo "$net_calc" | cut -d',' -f2)
+        local tx_rate=$(echo "$net_calc" | cut -d',' -f3)
+        local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
+        
+        convert_to_gelf "vnstat" "$interface" "$timestamp" "$utilization" "Network" \
+            "0" "0" "0" "$rx_mib" "$tx_mib" "$total_rate" "0" "0" "0"
     else
         log_error "Failed to get network stats"
     fi
 
-    # Disk monitoring
-    if df_output=$(df / -B m 2>/dev/null); then
-        local utilization=$(echo "$df_output" | awk 'NR==2 {gsub(/[^0-9]/, "", $5); print $5}')
-        local empt_size=$(echo "$df_output" | awk 'NR==2 {gsub(/[^0-9]/, "", $4); print $4}')
-        convert_to_gelf "df" "Disk" "$timestamp" "$utilization" "0" "0" "Disk" "0" "$empt_size" "0" "0" "0"
+    # Disk monitoring (root filesystem)
+    if df_output=$(df / -BM 2>/dev/null | tail -n1); then
+        local total=$(echo "$df_output" | awk '{print $2}' | sed 's/M//g')
+        local used=$(echo "$df_output" | awk '{print $3}' | sed 's/M//g')
+        local free=$(echo "$df_output" | awk '{print $4}' | sed 's/M//g')
+        local utilization=$(echo "$df_output" | awk '{print $5}' | sed 's/%//g')
+        
+        convert_to_gelf "df" "Disk" "$timestamp" "$utilization" "Disk" \
+            "$used" "$total" "$free" "0" "0" "0" "0" "0" "0"
     else
         log_error "Failed to get disk stats"
     fi
@@ -245,7 +346,7 @@ main() {
 
     # Check if process is already running
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-        log_error "Process already running"
+        log_error "Process already running (PID: $(cat "$PIDFILE"))"
         exit 1
     fi
 
@@ -259,7 +360,10 @@ main() {
     update_ip
 
     # Start monitoring
-    log_info "Starting monitoring service (HOST_ID: ${HOST_ID}, sending to ${GRAYLOG_SERVER}:${GRAYLOG_PORT})"
+    log_info "Starting monitoring service v02-004"
+    log_info "HOST_ID: ${HOST_ID}"
+    log_info "Target: ${GRAYLOG_SERVER}:${GRAYLOG_PORT}"
+    log_info "Interval: ${INTERVAL}s"
     monitor_loop
 }
 
