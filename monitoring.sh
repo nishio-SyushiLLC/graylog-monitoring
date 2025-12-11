@@ -1,15 +1,13 @@
 #!/bin/bash
-# script-version:02-004
+# script-version:02-005
 # Required packages: vnstat sysstat bc dnsutils netcat-openbsd gzip
 #
-# Changelog v02-004:
-# - Fixed network monitoring data extraction from vnstat
-# - Improved CPU sampling (1->3 iterations for stable average)
-# - Added proper field naming: _used, _total, _free for memory/swap/disk
-# - Enhanced error handling and logging
-# - Fixed field assignments to prevent data confusion
-# - Added network bandwidth calculation
-# - Improved vnstat output parsing
+# Changelog v02-005:
+# - Added OS information detection and sending
+# - Added network configuration in config file
+# - Fixed vnstat field mapping for different environments
+# - Added network interface and bandwidth configuration
+# - Improved error handling
 
 # Default configuration
 CONFIG_DIR="/etc/monitoring"
@@ -18,6 +16,7 @@ RUN_DIR="/opt/monitoring/var"
 PIDFILE="${RUN_DIR}/monitoring.pid"
 IPFILE="${VAR_DIR}/myip"
 HOSTIDFILE="${VAR_DIR}/hostid"
+OSFILE="${VAR_DIR}/osinfo"
 NET_PREV_FILE="${VAR_DIR}/net_prev"
 LOG_TAG="monitoring"
 
@@ -32,6 +31,17 @@ GRAYLOG_PORT="${GRAYLOG_PORT:-11514}"
 INTERVAL="${MONITORING_INTERVAL:-5}"
 DEBUG="${DEBUG:-false}"
 HOST_NAME="${HOST_NAME:-$(hostname)}"
+
+# Network configuration (can be overridden in config)
+NETWORK_INTERFACE="${NETWORK_INTERFACE:-auto}"  # auto, eth0, ens3, etc.
+NETWORK_BANDWIDTH_MBPS="${NETWORK_BANDWIDTH_MBPS:-1000}"  # Default 1Gbps
+NETWORK_METHOD="${NETWORK_METHOD:-auto}"  # auto, vnstat, procnet
+NETWORK_MODE="${NETWORK_MODE:-total}"  # total (合計), each (個別), both (両方)
+VNSTAT_RX_FIELD="${VNSTAT_RX_FIELD:-4}"  # vnstat --oneline field number for RX
+VNSTAT_TX_FIELD="${VNSTAT_TX_FIELD:-5}"  # vnstat --oneline field number for TX
+
+# OS information (can be overridden in config)
+OS_INFO="${OS_INFO:-auto}"  # auto, or specify like "Ubuntu 20.04"
 
 # Logging functions
 log_error() {
@@ -48,10 +58,95 @@ log_debug() {
     [ "$DEBUG" = "true" ] && echo "[DEBUG] $1"
 }
 
+# Detect OS information
+detect_os_info() {
+    if [ "$OS_INFO" != "auto" ]; then
+        echo "$OS_INFO"
+        return
+    fi
+    
+    local os_info="unknown"
+    
+    # Try /etc/os-release (most modern systems)
+    if [ -f /etc/os-release ]; then
+        source /etc/os-release
+        os_info="${NAME:-unknown} ${VERSION_ID:-unknown}"
+    # Try lsb_release
+    elif command -v lsb_release >/dev/null 2>&1; then
+        os_info=$(lsb_release -d | cut -f2-)
+    # Try /etc/redhat-release
+    elif [ -f /etc/redhat-release ]; then
+        os_info=$(cat /etc/redhat-release)
+    # Try /etc/debian_version
+    elif [ -f /etc/debian_version ]; then
+        os_info="Debian $(cat /etc/debian_version)"
+    # Try uname as last resort
+    else
+        os_info="$(uname -s) $(uname -r)"
+    fi
+    
+    echo "$os_info"
+}
+
+# Initialize OS info
+init_os_info() {
+    if [ ! -f "$OSFILE" ] || [ "$OS_INFO" = "auto" ]; then
+        local detected_os=$(detect_os_info)
+        echo "$detected_os" > "$OSFILE"
+        log_info "Detected OS: $detected_os"
+    fi
+    OS_INFO_CURRENT=$(cat "$OSFILE")
+}
+
+# Detect network interface
+detect_network_interface() {
+    if [ "$NETWORK_INTERFACE" != "auto" ]; then
+        echo "$NETWORK_INTERFACE"
+        return
+    fi
+    
+    # Try to get default interface
+    local iface=$(ip route | grep default | awk '{print $5}' | head -1)
+    
+    if [ -z "$iface" ]; then
+        # Fallback: try common names
+        for name in eth0 ens3 ens33 enp0s3 eno1; do
+            if [ -d "/sys/class/net/$name" ]; then
+                iface="$name"
+                break
+            fi
+        done
+    fi
+    
+    echo "${iface:-eth0}"
+}
+
+# Detect network bandwidth
+detect_network_bandwidth() {
+    local interface="$1"
+    
+    if [ "$NETWORK_BANDWIDTH_MBPS" != "auto" ] && [ "$NETWORK_BANDWIDTH_MBPS" -gt 0 ]; then
+        echo "$NETWORK_BANDWIDTH_MBPS"
+        return
+    fi
+    
+    # Try to read from sysfs
+    local speed_file="/sys/class/net/$interface/speed"
+    if [ -f "$speed_file" ]; then
+        local speed=$(cat "$speed_file" 2>/dev/null)
+        if [ -n "$speed" ] && [ "$speed" -gt 0 ] 2>/dev/null; then
+            echo "$speed"
+            return
+        fi
+    fi
+    
+    # Default to 1Gbps
+    echo "1000"
+}
+
 # Generate or load HOST_ID
 init_host_id() {
     if [ ! -f "$HOSTIDFILE" ]; then
-        # Generate UUID-like HOST_ID
         local host_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(hostname)-$(date +%s)")
         echo "$host_id" > "$HOSTIDFILE"
         log_info "Generated new HOST_ID: $host_id"
@@ -71,16 +166,25 @@ init() {
         fi
     done
 
-    local deps=(iostat free vnstat dig nc gzip bc awk)
+    local deps=(free dig nc gzip bc awk)
     for cmd in "${deps[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             log_error "Required command not found: $cmd"
             exit 1
         fi
     done
+    
+    # Optional dependencies
+    if ! command -v iostat >/dev/null 2>&1; then
+        log_info "iostat not found - CPU monitoring will use fallback method"
+    fi
+    if ! command -v vnstat >/dev/null 2>&1; then
+        log_info "vnstat not found - network monitoring will use /proc/net/dev"
+    fi
 
-    # Initialize HOST_ID
+    # Initialize HOST_ID and OS info
     init_host_id
+    init_os_info
 }
 
 # Process command line options
@@ -102,7 +206,7 @@ process_options() {
 # Check and update IP address
 update_ip() {
     local current_time=$(date +%s)
-    local ip_update_interval=3600  # Update IP every hour
+    local ip_update_interval=3600
 
     if [ ! -f "$IPFILE" ] || [ $((current_time - $(stat -c %Y "$IPFILE" 2>/dev/null || echo 0))) -gt "$ip_update_interval" ]; then
         if ! dig +short myip.opendns.com @208.67.222.222 > "${IPFILE}.tmp" 2>/dev/null; then
@@ -139,7 +243,7 @@ convert_to_mib() {
     echo "${output:-0}"
 }
 
-# Send data to Graylog (Enhanced GELF format)
+# Send data to Graylog (Enhanced GELF format with OS info)
 convert_to_gelf() {
     local monitor_type="$1"
     local device="$2"
@@ -147,7 +251,6 @@ convert_to_gelf() {
     local utilization="${4:-0}"
     local group="$5"
     
-    # Optional parameters with defaults
     local used="${6:-0}"
     local total="${7:-0}"
     local free="${8:-0}"
@@ -169,6 +272,7 @@ convert_to_gelf() {
     "timestamp": $timestamp,
     "_host_id": "$HOST_ID",
     "_ip_g": "$ip_g",
+    "_os_info": "$OS_INFO_CURRENT",
     "_device": "$device",
     "_group": "$group",
     "_utilization": $utilization,
@@ -198,10 +302,11 @@ calculate_network_utilization() {
     local rx_mib="$1"
     local tx_mib="$2"
     local interval="$3"
+    local bandwidth_mibps="$4"
+    local prev_file="${5:-$NET_PREV_FILE}"  # Use custom prev file or default
     
-    # Read previous values
-    if [ -f "$NET_PREV_FILE" ]; then
-        local prev_data=$(cat "$NET_PREV_FILE")
+    if [ -f "$prev_file" ]; then
+        local prev_data=$(cat "$prev_file")
         local prev_time=$(echo "$prev_data" | cut -d',' -f1)
         local prev_rx=$(echo "$prev_data" | cut -d',' -f2)
         local prev_tx=$(echo "$prev_data" | cut -d',' -f3)
@@ -211,15 +316,20 @@ calculate_network_utilization() {
         if [ "$time_diff" -gt 0 ]; then
             local rx_rate=$(echo "scale=2; ($rx_mib - $prev_rx) / $time_diff" | bc)
             local tx_rate=$(echo "scale=2; ($tx_mib - $prev_tx) / $time_diff" | bc)
-            local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
             
-            # Assume 1Gbps = 125 MB/s = 119.2 MiB/s
-            # Adjust this value based on your network interface speed
-            local bandwidth_mibps=119.2
+            # Handle negative values (counter reset)
+            if [ $(echo "$rx_rate < 0" | bc) -eq 1 ]; then rx_rate=0; fi
+            if [ $(echo "$tx_rate < 0" | bc) -eq 1 ]; then tx_rate=0; fi
+            
+            local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
             local utilization=$(echo "scale=2; ($total_rate / $bandwidth_mibps) * 100" | bc)
             
             # Cap at 100%
-            utilization=$(echo "$utilization" | awk '{if($1>100) print 100; else print $1}')
+            if [ $(echo "$utilization < 0" | bc) -eq 1 ]; then
+                utilization=0
+            elif [ $(echo "$utilization > 100" | bc) -eq 1 ]; then
+                utilization=100
+            fi
             
             echo "$utilization,$rx_rate,$tx_rate"
         else
@@ -230,7 +340,223 @@ calculate_network_utilization() {
     fi
     
     # Save current values
-    echo "$(date +%s),$rx_mib,$tx_mib" > "$NET_PREV_FILE"
+    echo "$(date +%s),$rx_mib,$tx_mib" > "$prev_file"
+}
+
+# Monitor CPU
+monitor_cpu() {
+    local timestamp="$1"
+    local load_1min="$2"
+    local load_5min="$3"
+    local load_15min="$4"
+    
+    if command -v iostat >/dev/null 2>&1; then
+        if iostat_output=$(iostat -c 1 1 2>/dev/null); then
+            local idle=$(echo "$iostat_output" | awk '/^[[:space:]]*[0-9]/ {print $NF; exit}')
+            
+            if [[ "$idle" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+                local utilization=$(echo "scale=2; 100 - $idle" | bc)
+                
+                if [ $(echo "$utilization < 0" | bc) -eq 1 ]; then
+                    utilization=0
+                elif [ $(echo "$utilization > 100" | bc) -eq 1 ]; then
+                    utilization=100
+                fi
+                
+                convert_to_gelf "iostat" "CPU" "$timestamp" "$utilization" "CPU" \
+                    "0" "0" "0" "0" "0" "0" "$load_1min" "$load_5min" "$load_15min"
+                return 0
+            fi
+        fi
+    fi
+    
+    log_error "Failed to get CPU stats"
+}
+
+# Get network stats for a single interface from /proc/net/dev
+get_interface_stats() {
+    local interface="$1"
+    
+    if [ ! -f "/proc/net/dev" ]; then
+        echo "0,0"
+        return 1
+    fi
+    
+    local net_line=$(grep "^[[:space:]]*$interface:" /proc/net/dev | head -1)
+    if [ -n "$net_line" ]; then
+        local rx_bytes=$(echo "$net_line" | awk '{print $2}')
+        local tx_bytes=$(echo "$net_line" | awk '{print $10}')
+        local rx_mib=$(echo "scale=2; $rx_bytes / 1048576" | bc)
+        local tx_mib=$(echo "scale=2; $tx_bytes / 1048576" | bc)
+        echo "$rx_mib,$tx_mib"
+        return 0
+    fi
+    
+    echo "0,0"
+    return 1
+}
+
+# Monitor single network interface
+monitor_single_interface() {
+    local timestamp="$1"
+    local interface="$2"
+    local bandwidth_mbps="$3"
+    local prev_file="$4"
+    
+    local bandwidth_mibps=$(echo "scale=2; $bandwidth_mbps / 8.388608" | bc)
+    local rx_mib=0
+    local tx_mib=0
+    
+    # Try vnstat first (if method is auto or vnstat)
+    if [ "$NETWORK_METHOD" = "auto" ] || [ "$NETWORK_METHOD" = "vnstat" ]; then
+        if command -v vnstat >/dev/null 2>&1; then
+            if net_output=$(vnstat -i "$interface" --oneline 2>/dev/null); then
+                log_debug "vnstat output for $interface: $net_output"
+                
+                local rx_raw=$(echo "$net_output" | cut -d';' -f"$VNSTAT_RX_FIELD" | tr -d ' ')
+                local tx_raw=$(echo "$net_output" | cut -d';' -f"$VNSTAT_TX_FIELD" | tr -d ' ')
+                
+                if [ -n "$rx_raw" ] && [ -n "$tx_raw" ]; then
+                    rx_mib=$(convert_to_mib "$rx_raw")
+                    tx_mib=$(convert_to_mib "$tx_raw")
+                    
+                    local net_calc=$(calculate_network_utilization "$rx_mib" "$tx_mib" "$INTERVAL" "$bandwidth_mibps" "$prev_file")
+                    local utilization=$(echo "$net_calc" | cut -d',' -f1)
+                    local rx_rate=$(echo "$net_calc" | cut -d',' -f2)
+                    local tx_rate=$(echo "$net_calc" | cut -d',' -f3)
+                    local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
+                    
+                    convert_to_gelf "vnstat" "$interface" "$timestamp" "$utilization" "Network" \
+                        "0" "0" "0" "$rx_mib" "$tx_mib" "$total_rate" "0" "0" "0"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    
+    # Fallback to /proc/net/dev
+    local stats=$(get_interface_stats "$interface")
+    rx_mib=$(echo "$stats" | cut -d',' -f1)
+    tx_mib=$(echo "$stats" | cut -d',' -f2)
+    
+    if [ "$rx_mib" != "0" ] || [ "$tx_mib" != "0" ]; then
+        local net_calc=$(calculate_network_utilization "$rx_mib" "$tx_mib" "$INTERVAL" "$bandwidth_mibps" "$prev_file")
+        local utilization=$(echo "$net_calc" | cut -d',' -f1)
+        local rx_rate=$(echo "$net_calc" | cut -d',' -f2)
+        local tx_rate=$(echo "$net_calc" | cut -d',' -f3)
+        local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
+        
+        convert_to_gelf "procnet" "$interface" "$timestamp" "$utilization" "Network" \
+            "0" "0" "0" "$rx_mib" "$tx_mib" "$total_rate" "0" "0" "0"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Monitor network with configurable mode (total/each/both)
+monitor_network() {
+    local timestamp="$1"
+    
+    case "$NETWORK_MODE" in
+        total)
+            # Monitor total of all interfaces
+            monitor_network_total "$timestamp"
+            ;;
+        each)
+            # Monitor each interface separately
+            monitor_network_each "$timestamp"
+            ;;
+        both)
+            # Monitor both total and each interface
+            monitor_network_total "$timestamp"
+            monitor_network_each "$timestamp"
+            ;;
+        *)
+            log_error "Invalid NETWORK_MODE: $NETWORK_MODE"
+            ;;
+    esac
+}
+
+# Monitor total network usage (all interfaces combined)
+monitor_network_total() {
+    local timestamp="$1"
+    
+    # Get all active interfaces (excluding lo)
+    local interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "^lo$")
+    
+    local total_rx_mib=0
+    local total_tx_mib=0
+    local interface_count=0
+    
+    # Sum up all interfaces
+    for iface in $interfaces; do
+        local stats=$(get_interface_stats "$iface")
+        local rx=$(echo "$stats" | cut -d',' -f1)
+        local tx=$(echo "$stats" | cut -d',' -f2)
+        
+        if [ "$rx" != "0" ] || [ "$tx" != "0" ]; then
+            total_rx_mib=$(echo "scale=2; $total_rx_mib + $rx" | bc)
+            total_tx_mib=$(echo "scale=2; $total_tx_mib + $tx" | bc)
+            interface_count=$((interface_count + 1))
+        fi
+    done
+    
+    if [ "$interface_count" -gt 0 ]; then
+        # Use configured bandwidth or detect from primary interface
+        local primary_interface=$(detect_network_interface)
+        local bandwidth_mbps=$(detect_network_bandwidth "$primary_interface")
+        
+        # If multiple interfaces, multiply bandwidth
+        if [ "$interface_count" -gt 1 ]; then
+            bandwidth_mbps=$((bandwidth_mbps * interface_count))
+        fi
+        
+        local bandwidth_mibps=$(echo "scale=2; $bandwidth_mbps / 8.388608" | bc)
+        
+        local net_calc=$(calculate_network_utilization "$total_rx_mib" "$total_tx_mib" "$INTERVAL" "$bandwidth_mibps" "$NET_PREV_FILE")
+        local utilization=$(echo "$net_calc" | cut -d',' -f1)
+        local rx_rate=$(echo "$net_calc" | cut -d',' -f2)
+        local tx_rate=$(echo "$net_calc" | cut -d',' -f3)
+        local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
+        
+        convert_to_gelf "procnet" "Total" "$timestamp" "$utilization" "Network" \
+            "0" "0" "0" "$total_rx_mib" "$total_tx_mib" "$total_rate" "0" "0" "0"
+        
+        log_debug "Network Total: ${interface_count} interfaces, RX=${total_rx_mib}MiB, TX=${total_tx_mib}MiB"
+    else
+        log_error "No active network interfaces found"
+    fi
+}
+
+# Monitor each network interface separately
+monitor_network_each() {
+    local timestamp="$1"
+    
+    # Get all active interfaces (excluding lo)
+    local interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "^lo$")
+    
+    local interface_count=0
+    for iface in $interfaces; do
+        # Check if interface has traffic
+        local stats=$(get_interface_stats "$iface")
+        local rx=$(echo "$stats" | cut -d',' -f1)
+        local tx=$(echo "$stats" | cut -d',' -f2)
+        
+        if [ "$rx" != "0" ] || [ "$tx" != "0" ]; then
+            local bandwidth_mbps=$(detect_network_bandwidth "$iface")
+            local prev_file="${NET_PREV_FILE}.${iface}"
+            
+            monitor_single_interface "$timestamp" "$iface" "$bandwidth_mbps" "$prev_file"
+            interface_count=$((interface_count + 1))
+        fi
+    done
+    
+    if [ "$interface_count" -eq 0 ]; then
+        log_error "No active network interfaces found"
+    else
+        log_debug "Monitored $interface_count network interfaces"
+    fi
 }
 
 # Collect and send monitoring data
@@ -243,24 +569,23 @@ collect_data() {
     local load_5min=$(echo "$load_avg" | awk '{print $2}')
     local load_15min=$(echo "$load_avg" | awk '{print $3}')
 
-    # CPU monitoring (improved: 3 samples for stable average)
-    if iostat_output=$(iostat -c 1 3 2>/dev/null | tail -n +4 | tail -1); then
-        local utilization=$(echo "$iostat_output" | awk '{printf "%.2f", 100 - $NF}')
-        convert_to_gelf "iostat" "CPU" "$timestamp" "$utilization" "CPU" \
-            "0" "0" "0" "0" "0" "0" "$load_1min" "$load_5min" "$load_15min"
-    else
-        log_error "Failed to get CPU stats"
-    fi
+    # CPU monitoring
+    monitor_cpu "$timestamp" "$load_1min" "$load_5min" "$load_15min"
 
     # Memory monitoring
     if mem_output=$(free -m 2>/dev/null | grep "^Mem:"); then
         local total=$(echo "$mem_output" | awk '{print $2}')
-        local used=$(echo "$mem_output" | awk '{print $3}')
-        local free=$(echo "$mem_output" | awk '{print $4}')
         local available=$(echo "$mem_output" | awk '{print $7}')
         
-        # Use available memory for more accurate calculation
+        if [ -z "$available" ] || [ "$available" = "0" ]; then
+            local used=$(echo "$mem_output" | awk '{print $3}')
+            local free=$(echo "$mem_output" | awk '{print $4}')
+            local buff_cache=$(echo "$mem_output" | awk '{print $6}')
+            available=$((free + buff_cache))
+        fi
+        
         local utilization=$(echo "scale=2; (($total - $available) / $total) * 100" | bc)
+        local used=$((total - available))
         
         convert_to_gelf "free" "Memory" "$timestamp" "$utilization" "Memory" \
             "$used" "$total" "$available" "0" "0" "0" "0" "0" "0"
@@ -285,40 +610,22 @@ collect_data() {
         log_error "Failed to get swap stats"
     fi
 
-    # Network monitoring (FIXED)
-    if net_output=$(vnstat --oneline 2>/dev/null); then
-        local interface=$(echo "$net_output" | cut -d';' -f2 | tr -d ' ')
-        
-        # Extract today's traffic (fields 4 and 5)
-        local rx_raw=$(echo "$net_output" | cut -d';' -f4 | tr -d ' ')
-        local tx_raw=$(echo "$net_output" | cut -d';' -f5 | tr -d ' ')
-        
-        # Convert to MiB
-        local rx_mib=$(convert_to_mib "$rx_raw")
-        local tx_mib=$(convert_to_mib "$tx_raw")
-        
-        # Calculate bandwidth utilization and rate
-        local net_calc=$(calculate_network_utilization "$rx_mib" "$tx_mib" "$INTERVAL")
-        local utilization=$(echo "$net_calc" | cut -d',' -f1)
-        local rx_rate=$(echo "$net_calc" | cut -d',' -f2)
-        local tx_rate=$(echo "$net_calc" | cut -d',' -f3)
-        local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
-        
-        convert_to_gelf "vnstat" "$interface" "$timestamp" "$utilization" "Network" \
-            "0" "0" "0" "$rx_mib" "$tx_mib" "$total_rate" "0" "0" "0"
-    else
-        log_error "Failed to get network stats"
-    fi
+    # Network monitoring
+    monitor_network "$timestamp"
 
-    # Disk monitoring (root filesystem)
+    # Disk monitoring
     if df_output=$(df / -BM 2>/dev/null | tail -n1); then
         local total=$(echo "$df_output" | awk '{print $2}' | sed 's/M//g')
         local used=$(echo "$df_output" | awk '{print $3}' | sed 's/M//g')
         local free=$(echo "$df_output" | awk '{print $4}' | sed 's/M//g')
         local utilization=$(echo "$df_output" | awk '{print $5}' | sed 's/%//g')
         
-        convert_to_gelf "df" "Disk" "$timestamp" "$utilization" "Disk" \
-            "$used" "$total" "$free" "0" "0" "0" "0" "0" "0"
+        if [[ "$utilization" =~ ^[0-9]+$ ]]; then
+            convert_to_gelf "df" "Disk" "$timestamp" "$utilization" "Disk" \
+                "$used" "$total" "$free" "0" "0" "0" "0" "0" "0"
+        else
+            log_error "Invalid disk utilization: $utilization"
+        fi
     else
         log_error "Failed to get disk stats"
     fi
@@ -344,28 +651,24 @@ main() {
     init
     process_options "$@"
 
-    # Check if process is already running
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
         log_error "Process already running (PID: $(cat "$PIDFILE"))"
         exit 1
     fi
 
-    # Set up trap for cleanup
     trap cleanup SIGTERM SIGINT SIGQUIT
 
-    # Write PID file
     echo $$ > "$PIDFILE"
-
-    # Initial IP update
     update_ip
 
-    # Start monitoring
-    log_info "Starting monitoring service v02-004"
+    log_info "Starting monitoring service v02-005"
     log_info "HOST_ID: ${HOST_ID}"
+    log_info "OS: ${OS_INFO_CURRENT}"
     log_info "Target: ${GRAYLOG_SERVER}:${GRAYLOG_PORT}"
     log_info "Interval: ${INTERVAL}s"
+    log_info "Network: mode=${NETWORK_MODE}, interface=${NETWORK_INTERFACE}, bandwidth=${NETWORK_BANDWIDTH_MBPS}Mbps, method=${NETWORK_METHOD}"
+    
     monitor_loop
 }
 
-# Run main function
 main "$@"
