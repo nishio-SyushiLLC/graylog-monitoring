@@ -1,6 +1,10 @@
 #!/bin/bash
-# script-version:02-005
+# script-version:02-006
 # Required packages: vnstat sysstat bc dnsutils netcat-openbsd gzip
+#
+# Changelog v02-006:
+# - Fixed: bc output formatting issue (.88 -> 0.88) for proper JSON/Graylog parsing
+# - All numeric values now use printf for consistent formatting
 #
 # Changelog v02-005:
 # - Added OS information detection and sending
@@ -56,6 +60,20 @@ log_info() {
 
 log_debug() {
     [ "$DEBUG" = "true" ] && echo "[DEBUG] $1"
+}
+
+# Format number to ensure proper JSON format (prevent .88 -> 0.88)
+format_number() {
+    local value="$1"
+    local scale="${2:-2}"
+    
+    # If empty or invalid, return 0
+    if [ -z "$value" ] || ! [[ "$value" =~ ^-?[0-9]*\.?[0-9]+$ ]]; then
+        printf "%.${scale}f" "0"
+        return
+    fi
+    
+    printf "%.${scale}f" "$value"
 }
 
 # Detect OS information
@@ -226,13 +244,13 @@ convert_to_mib() {
 
     case "$unit" in
         GiB|GB|G)
-            output=$(echo "scale=2; $value * 1024" | bc)
+            output=$(echo "scale=4; $value * 1024" | bc)
             ;;
         MiB|MB|M|"")
             output="$value"
             ;;
         KiB|KB|K)
-            output=$(echo "scale=2; $value / 1024" | bc)
+            output=$(echo "scale=4; $value / 1024" | bc)
             ;;
         *)
             log_debug "Unknown unit '$unit' in '$input', treating as MiB"
@@ -240,7 +258,7 @@ convert_to_mib() {
             ;;
     esac
     
-    echo "${output:-0}"
+    format_number "${output:-0}" 2
 }
 
 # Send data to Graylog (Enhanced GELF format with OS info)
@@ -263,6 +281,18 @@ convert_to_gelf() {
     local ip_g
 
     ip_g=$(cat "$IPFILE" 2>/dev/null || echo "unknown")
+    
+    # Format all numbers properly
+    utilization=$(format_number "$utilization" 2)
+    used=$(format_number "$used" 2)
+    total=$(format_number "$total" 2)
+    free=$(format_number "$free" 2)
+    rx=$(format_number "$rx" 2)
+    tx=$(format_number "$tx" 2)
+    rate=$(format_number "$rate" 2)
+    load_1min=$(format_number "$load_1min" 2)
+    load_5min=$(format_number "$load_5min" 2)
+    load_15min=$(format_number "$load_15min" 2)
 
     local json=$(cat <<EOF
 {
@@ -314,29 +344,36 @@ calculate_network_utilization() {
         local time_diff=$(($(date +%s) - prev_time))
         
         if [ "$time_diff" -gt 0 ]; then
-            local rx_rate=$(echo "scale=2; ($rx_mib - $prev_rx) / $time_diff" | bc)
-            local tx_rate=$(echo "scale=2; ($tx_mib - $prev_tx) / $time_diff" | bc)
+            local rx_rate=$(echo "scale=4; ($rx_mib - $prev_rx) / $time_diff" | bc)
+            local tx_rate=$(echo "scale=4; ($tx_mib - $prev_tx) / $time_diff" | bc)
+            
+            # Format properly
+            rx_rate=$(format_number "$rx_rate" 2)
+            tx_rate=$(format_number "$tx_rate" 2)
             
             # Handle negative values (counter reset)
-            if [ $(echo "$rx_rate < 0" | bc) -eq 1 ]; then rx_rate=0; fi
-            if [ $(echo "$tx_rate < 0" | bc) -eq 1 ]; then tx_rate=0; fi
+            if [ $(echo "$rx_rate < 0" | bc) -eq 1 ]; then rx_rate="0.00"; fi
+            if [ $(echo "$tx_rate < 0" | bc) -eq 1 ]; then tx_rate="0.00"; fi
             
-            local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
-            local utilization=$(echo "scale=2; ($total_rate / $bandwidth_mibps) * 100" | bc)
+            local total_rate=$(echo "scale=4; $rx_rate + $tx_rate" | bc)
+            total_rate=$(format_number "$total_rate" 2)
+            
+            local utilization=$(echo "scale=4; ($total_rate / $bandwidth_mibps) * 100" | bc)
+            utilization=$(format_number "$utilization" 2)
             
             # Cap at 100%
             if [ $(echo "$utilization < 0" | bc) -eq 1 ]; then
-                utilization=0
+                utilization="0.00"
             elif [ $(echo "$utilization > 100" | bc) -eq 1 ]; then
-                utilization=100
+                utilization="100.00"
             fi
             
             echo "$utilization,$rx_rate,$tx_rate"
         else
-            echo "0,0,0"
+            echo "0.00,0.00,0.00"
         fi
     else
-        echo "0,0,0"
+        echo "0.00,0.00,0.00"
     fi
     
     # Save current values
@@ -351,16 +388,19 @@ monitor_cpu() {
     local load_15min="$4"
     
     if command -v iostat >/dev/null 2>&1; then
-        if iostat_output=$(iostat -c 1 1 2>/dev/null); then
-            local idle=$(echo "$iostat_output" | awk '/^[[:space:]]*[0-9]/ {print $NF; exit}')
+        if iostat_output=$(iostat -c 1 3 2>/dev/null); then
+            # Get the last set of CPU stats (after 3 second sampling)
+            local idle=$(echo "$iostat_output" | awk '/^[[:space:]]*[0-9]/ {idle=$NF} END {print idle}')
             
             if [[ "$idle" =~ ^[0-9]+\.?[0-9]*$ ]]; then
-                local utilization=$(echo "scale=2; 100 - $idle" | bc)
+                local utilization_raw=$(echo "scale=4; 100 - $idle" | bc)
+                local utilization=$(format_number "$utilization_raw" 2)
                 
+                # Ensure range 0-100
                 if [ $(echo "$utilization < 0" | bc) -eq 1 ]; then
-                    utilization=0
+                    utilization="0.00"
                 elif [ $(echo "$utilization > 100" | bc) -eq 1 ]; then
-                    utilization=100
+                    utilization="100.00"
                 fi
                 
                 convert_to_gelf "iostat" "CPU" "$timestamp" "$utilization" "CPU" \
@@ -378,7 +418,7 @@ get_interface_stats() {
     local interface="$1"
     
     if [ ! -f "/proc/net/dev" ]; then
-        echo "0,0"
+        echo "0.00,0.00"
         return 1
     fi
     
@@ -386,13 +426,15 @@ get_interface_stats() {
     if [ -n "$net_line" ]; then
         local rx_bytes=$(echo "$net_line" | awk '{print $2}')
         local tx_bytes=$(echo "$net_line" | awk '{print $10}')
-        local rx_mib=$(echo "scale=2; $rx_bytes / 1048576" | bc)
-        local tx_mib=$(echo "scale=2; $tx_bytes / 1048576" | bc)
+        local rx_mib_raw=$(echo "scale=4; $rx_bytes / 1048576" | bc)
+        local tx_mib_raw=$(echo "scale=4; $tx_bytes / 1048576" | bc)
+        local rx_mib=$(format_number "$rx_mib_raw" 2)
+        local tx_mib=$(format_number "$tx_mib_raw" 2)
         echo "$rx_mib,$tx_mib"
         return 0
     fi
     
-    echo "0,0"
+    echo "0.00,0.00"
     return 1
 }
 
@@ -403,9 +445,10 @@ monitor_single_interface() {
     local bandwidth_mbps="$3"
     local prev_file="$4"
     
-    local bandwidth_mibps=$(echo "scale=2; $bandwidth_mbps / 8.388608" | bc)
-    local rx_mib=0
-    local tx_mib=0
+    local bandwidth_mibps_raw=$(echo "scale=4; $bandwidth_mbps / 8.388608" | bc)
+    local bandwidth_mibps=$(format_number "$bandwidth_mibps_raw" 2)
+    local rx_mib="0.00"
+    local tx_mib="0.00"
     
     # Try vnstat first (if method is auto or vnstat)
     if [ "$NETWORK_METHOD" = "auto" ] || [ "$NETWORK_METHOD" = "vnstat" ]; then
@@ -424,7 +467,8 @@ monitor_single_interface() {
                     local utilization=$(echo "$net_calc" | cut -d',' -f1)
                     local rx_rate=$(echo "$net_calc" | cut -d',' -f2)
                     local tx_rate=$(echo "$net_calc" | cut -d',' -f3)
-                    local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
+                    local total_rate_raw=$(echo "scale=4; $rx_rate + $tx_rate" | bc)
+                    local total_rate=$(format_number "$total_rate_raw" 2)
                     
                     convert_to_gelf "vnstat" "$interface" "$timestamp" "$utilization" "Network" \
                         "0" "0" "0" "$rx_mib" "$tx_mib" "$total_rate" "0" "0" "0"
@@ -439,12 +483,13 @@ monitor_single_interface() {
     rx_mib=$(echo "$stats" | cut -d',' -f1)
     tx_mib=$(echo "$stats" | cut -d',' -f2)
     
-    if [ "$rx_mib" != "0" ] || [ "$tx_mib" != "0" ]; then
+    if [ "$rx_mib" != "0.00" ] || [ "$tx_mib" != "0.00" ]; then
         local net_calc=$(calculate_network_utilization "$rx_mib" "$tx_mib" "$INTERVAL" "$bandwidth_mibps" "$prev_file")
         local utilization=$(echo "$net_calc" | cut -d',' -f1)
         local rx_rate=$(echo "$net_calc" | cut -d',' -f2)
         local tx_rate=$(echo "$net_calc" | cut -d',' -f3)
-        local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
+        local total_rate_raw=$(echo "scale=4; $rx_rate + $tx_rate" | bc)
+        local total_rate=$(format_number "$total_rate_raw" 2)
         
         convert_to_gelf "procnet" "$interface" "$timestamp" "$utilization" "Network" \
             "0" "0" "0" "$rx_mib" "$tx_mib" "$total_rate" "0" "0" "0"
@@ -485,8 +530,8 @@ monitor_network_total() {
     # Get all active interfaces (excluding lo)
     local interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "^lo$")
     
-    local total_rx_mib=0
-    local total_tx_mib=0
+    local total_rx_mib="0.00"
+    local total_tx_mib="0.00"
     local interface_count=0
     
     # Sum up all interfaces
@@ -495,9 +540,11 @@ monitor_network_total() {
         local rx=$(echo "$stats" | cut -d',' -f1)
         local tx=$(echo "$stats" | cut -d',' -f2)
         
-        if [ "$rx" != "0" ] || [ "$tx" != "0" ]; then
-            total_rx_mib=$(echo "scale=2; $total_rx_mib + $rx" | bc)
-            total_tx_mib=$(echo "scale=2; $total_tx_mib + $tx" | bc)
+        if [ "$rx" != "0.00" ] || [ "$tx" != "0.00" ]; then
+            local total_rx_raw=$(echo "scale=4; $total_rx_mib + $rx" | bc)
+            local total_tx_raw=$(echo "scale=4; $total_tx_mib + $tx" | bc)
+            total_rx_mib=$(format_number "$total_rx_raw" 2)
+            total_tx_mib=$(format_number "$total_tx_raw" 2)
             interface_count=$((interface_count + 1))
         fi
     done
@@ -512,13 +559,15 @@ monitor_network_total() {
             bandwidth_mbps=$((bandwidth_mbps * interface_count))
         fi
         
-        local bandwidth_mibps=$(echo "scale=2; $bandwidth_mbps / 8.388608" | bc)
+        local bandwidth_mibps_raw=$(echo "scale=4; $bandwidth_mbps / 8.388608" | bc)
+        local bandwidth_mibps=$(format_number "$bandwidth_mibps_raw" 2)
         
         local net_calc=$(calculate_network_utilization "$total_rx_mib" "$total_tx_mib" "$INTERVAL" "$bandwidth_mibps" "$NET_PREV_FILE")
         local utilization=$(echo "$net_calc" | cut -d',' -f1)
         local rx_rate=$(echo "$net_calc" | cut -d',' -f2)
         local tx_rate=$(echo "$net_calc" | cut -d',' -f3)
-        local total_rate=$(echo "scale=2; $rx_rate + $tx_rate" | bc)
+        local total_rate_raw=$(echo "scale=4; $rx_rate + $tx_rate" | bc)
+        local total_rate=$(format_number "$total_rate_raw" 2)
         
         convert_to_gelf "procnet" "Total" "$timestamp" "$utilization" "Network" \
             "0" "0" "0" "$total_rx_mib" "$total_tx_mib" "$total_rate" "0" "0" "0"
@@ -543,7 +592,7 @@ monitor_network_each() {
         local rx=$(echo "$stats" | cut -d',' -f1)
         local tx=$(echo "$stats" | cut -d',' -f2)
         
-        if [ "$rx" != "0" ] || [ "$tx" != "0" ]; then
+        if [ "$rx" != "0.00" ] || [ "$tx" != "0.00" ]; then
             local bandwidth_mbps=$(detect_network_bandwidth "$iface")
             local prev_file="${NET_PREV_FILE}.${iface}"
             
@@ -584,7 +633,8 @@ collect_data() {
             available=$((free + buff_cache))
         fi
         
-        local utilization=$(echo "scale=2; (($total - $available) / $total) * 100" | bc)
+        local utilization_raw=$(echo "scale=4; (($total - $available) / $total) * 100" | bc)
+        local utilization=$(format_number "$utilization_raw" 2)
         local used=$((total - available))
         
         convert_to_gelf "free" "Memory" "$timestamp" "$utilization" "Memory" \
@@ -599,9 +649,10 @@ collect_data() {
         local used=$(echo "$swap_output" | awk '{print $3}')
         local free=$(echo "$swap_output" | awk '{print $4}')
         
-        local utilization=0
+        local utilization="0.00"
         if [ "$total" -gt 0 ]; then
-            utilization=$(echo "scale=2; ($used / $total) * 100" | bc)
+            local utilization_raw=$(echo "scale=4; ($used / $total) * 100" | bc)
+            utilization=$(format_number "$utilization_raw" 2)
         fi
         
         convert_to_gelf "swap" "Swap" "$timestamp" "$utilization" "Swap" \
@@ -621,6 +672,8 @@ collect_data() {
         local utilization=$(echo "$df_output" | awk '{print $5}' | sed 's/%//g')
         
         if [[ "$utilization" =~ ^[0-9]+$ ]]; then
+            utilization=$(format_number "$utilization" 0)
+            
             convert_to_gelf "df" "Disk" "$timestamp" "$utilization" "Disk" \
                 "$used" "$total" "$free" "0" "0" "0" "0" "0" "0"
         else
@@ -661,7 +714,7 @@ main() {
     echo $$ > "$PIDFILE"
     update_ip
 
-    log_info "Starting monitoring service v02-005"
+    log_info "Starting monitoring service v02-006"
     log_info "HOST_ID: ${HOST_ID}"
     log_info "OS: ${OS_INFO_CURRENT}"
     log_info "Target: ${GRAYLOG_SERVER}:${GRAYLOG_PORT}"
