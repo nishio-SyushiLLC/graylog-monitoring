@@ -1,6 +1,10 @@
 #!/bin/bash
-# script-version:02-006
+# script-version:02-006-lxc-fix
 # Required packages: vnstat sysstat bc dnsutils netcat-openbsd gzip
+#
+# Changelog v02-006-lxc-fix:
+# - Fixed: LXC container interface name issue (eth0@if44 -> eth0)
+# - Now correctly handles interface names with @ suffix in /proc/net/dev lookup
 #
 # Changelog v02-006:
 # - Fixed: bc output formatting issue (.88 -> 0.88) for proper JSON/Graylog parsing
@@ -417,6 +421,9 @@ monitor_cpu() {
 get_interface_stats() {
     local interface="$1"
     
+    # Remove @ifXX suffix for LXC containers (e.g., eth0@if44 -> eth0)
+    interface="${interface%%@*}"
+    
     if [ ! -f "/proc/net/dev" ]; then
         echo "0.00,0.00"
         return 1
@@ -536,7 +543,10 @@ monitor_network_total() {
     
     # Sum up all interfaces
     for iface in $interfaces; do
-        local stats=$(get_interface_stats "$iface")
+        # Remove @ifXX suffix for LXC containers (e.g., eth0@if44 -> eth0)
+        local clean_iface="${iface%%@*}"
+        
+        local stats=$(get_interface_stats "$clean_iface")
         local rx=$(echo "$stats" | cut -d',' -f1)
         local tx=$(echo "$stats" | cut -d',' -f2)
         
@@ -587,16 +597,19 @@ monitor_network_each() {
     
     local interface_count=0
     for iface in $interfaces; do
+        # Remove @ifXX suffix for LXC containers (e.g., eth0@if44 -> eth0)
+        local clean_iface="${iface%%@*}"
+        
         # Check if interface has traffic
-        local stats=$(get_interface_stats "$iface")
+        local stats=$(get_interface_stats "$clean_iface")
         local rx=$(echo "$stats" | cut -d',' -f1)
         local tx=$(echo "$stats" | cut -d',' -f2)
         
         if [ "$rx" != "0.00" ] || [ "$tx" != "0.00" ]; then
-            local bandwidth_mbps=$(detect_network_bandwidth "$iface")
-            local prev_file="${NET_PREV_FILE}.${iface}"
+            local bandwidth_mbps=$(detect_network_bandwidth "$clean_iface")
+            local prev_file="${NET_PREV_FILE}.${clean_iface}"
             
-            monitor_single_interface "$timestamp" "$iface" "$bandwidth_mbps" "$prev_file"
+            monitor_single_interface "$timestamp" "$clean_iface" "$bandwidth_mbps" "$prev_file"
             interface_count=$((interface_count + 1))
         fi
     done
@@ -714,7 +727,7 @@ main() {
     echo $$ > "$PIDFILE"
     update_ip
 
-    log_info "Starting monitoring service v02-006"
+    log_info "Starting monitoring service v02-006-lxc-fix"
     log_info "HOST_ID: ${HOST_ID}"
     log_info "OS: ${OS_INFO_CURRENT}"
     log_info "Target: ${GRAYLOG_SERVER}:${GRAYLOG_PORT}"
